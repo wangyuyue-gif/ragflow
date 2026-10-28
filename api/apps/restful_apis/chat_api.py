@@ -184,6 +184,9 @@ def _build_session_response(conv: dict) -> dict:
     conv = dict(conv)
     conv["chat_id"] = conv.pop("dialog_id", conv.get("chat_id"))
     conv["messages"] = conv.pop("message", conv.get("messages", []))
+    # get_list no longer selects the heavy message/reference columns, so list
+    # rows arrive without them; keep the response shape stable with empties.
+    conv.setdefault("reference", [])
     return conv
 
 
@@ -893,7 +896,8 @@ async def list_sessions(chat_id):
 @manager.route("/chats/<chat_id>/sessions/<session_id>", methods=["GET"])  # noqa: F821
 @login_required
 async def get_session(chat_id, session_id):
-    if not await _ensure_owned_chat(chat_id):
+    dialog = await _ensure_owned_chat(chat_id)
+    if not dialog:
         return get_json_result(data=False, message="no authorization", code=RetCode.AUTHENTICATION_ERROR)
     try:
         ok, conv = await thread_pool_exec(ConversationService.get_by_id, session_id)
@@ -901,14 +905,12 @@ async def get_session(chat_id, session_id):
             return get_data_error_result(message="Session not found!")
         if conv.dialog_id != chat_id:
             return get_data_error_result(message="Session does not belong to this chat!")
-        dialog = await _ensure_owned_chat(chat_id)
-        avatar = dialog[0].icon if dialog else ""
         for ref in conv.reference:
             if isinstance(ref, list):
                 continue
             ref["chunks"] = chunks_format(ref)
         result = _build_session_response(conv.to_dict())
-        result["avatar"] = avatar
+        result["avatar"] = dialog[0].icon
         return get_json_result(data=result)
     except Exception as ex:
         return server_error_response(ex)

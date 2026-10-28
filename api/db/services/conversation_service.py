@@ -38,7 +38,19 @@ class ConversationService(CommonService):
     @classmethod
     @DB.connection_context()
     def get_list(cls, dialog_id, page_number, items_per_page, orderby, desc, id, name, user_id=None):
-        sessions = cls.model.select().where(cls.model.dialog_id == dialog_id)
+        # List views only need session metadata. The `message` and `reference`
+        # JSON columns hold entire chat histories including retrieval chunks,
+        # so selecting them here makes the listing arbitrarily heavy.
+        sessions = cls.model.select(
+            cls.model.id,
+            cls.model.dialog_id,
+            cls.model.name,
+            cls.model.user_id,
+            cls.model.create_time,
+            cls.model.create_date,
+            cls.model.update_time,
+            cls.model.update_date,
+        ).where(cls.model.dialog_id == dialog_id)
         if id:
             sessions = sessions.where(cls.model.id == id)
         if name:
