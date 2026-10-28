@@ -187,7 +187,20 @@ def _build_session_response(conv: dict) -> dict:
     # get_list no longer selects the heavy message/reference columns, so list
     # rows arrive without them; keep the response shape stable with empties.
     conv.setdefault("reference", [])
+    conv["messages"] = _sanitize_session_messages(conv["messages"])
     return conv
+
+
+# Fields worth keeping on a stored/returned message. The web UI posts the
+# whole history back with pass_all_history_messages, and its assistant
+# messages carry the full streamed answer object (per-message `reference`
+# with chunk contents, `prompt`, `usage`, ...), which used to be persisted
+# verbatim and bloated conversations to tens of MB.
+_MESSAGE_KEEP_KEYS = {"id", "role", "content", "files", "created_at", "thumbup", "feedback"}
+
+
+def _sanitize_session_messages(messages):
+    return [{k: v for k, v in m.items() if k in _MESSAGE_KEEP_KEYS} for m in messages or [] if isinstance(m, dict)]
 
 
 async def _ensure_owned_chat(chat_id):
@@ -1287,7 +1300,7 @@ async def session_completion(chat_id_in_arg=""):
                 session_id = conv.id
 
             if pass_all_history_messages:
-                conv.message = deepcopy(request_messages)
+                conv.message = _sanitize_session_messages(request_messages)
                 msg = request_msg
             else:
                 if not conv.message:
