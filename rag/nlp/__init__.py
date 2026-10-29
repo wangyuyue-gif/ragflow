@@ -1822,7 +1822,7 @@ def concat_img(img1, img2):
 
     new_width = max(width1, width2)
     new_height = height1 + height2
-    new_image = Image.new("RGB", (new_width, new_height))
+    new_image = Image.new("RGB", (new_width, new_height), (255, 255, 255))
 
     new_image.paste(img1, (0, 0))
     new_image.paste(img2, (0, height1))
