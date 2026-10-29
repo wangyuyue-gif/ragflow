@@ -763,6 +763,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         if embd_mdl:
             retrieval_question = " ".join(questions)
             retrieval_tasks = split_retrieval_tasks(retrieval_question)
+            multi_task_retrieval = len(retrieval_tasks) > 1
             if len(retrieval_tasks) > 1:
                 if len(retrieval_tasks) > dialog.top_n:
                     logging.warning(
@@ -799,7 +800,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                         len(task_doc_ids or []),
                         task_top_n,
                     )
-                    return await retriever.retrieval(
+                    task_result = await retriever.retrieval(
                         task.query,
                         embd_mdl,
                         tenant_ids,
@@ -815,6 +816,12 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                         rank_feature=label_question(task.query, kbs),
                         rerank_candidates_count=rerank_candidates_count,
                     )
+                    if prompt_config.get("toc_enhance"):
+                        toc_chunks = await retriever.retrieval_by_toc(task.query, task_result["chunks"], tenant_ids, chat_mdl, task_top_n)
+                        if toc_chunks:
+                            task_result["chunks"] = toc_chunks
+                    task_result["chunks"] = retriever.retrieval_by_children(task_result["chunks"], tenant_ids)
+                    return task_result
 
                 kbinfos = await retrieve_and_merge_tasks(
                     retrieval_tasks,
@@ -839,11 +846,12 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     rank_feature=label_question(retrieval_question, kbs),
                     rerank_candidates_count=rerank_candidates_count,
                 )
-            if prompt_config.get("toc_enhance"):
+            if not multi_task_retrieval and prompt_config.get("toc_enhance"):
                 cks = await retriever.retrieval_by_toc(retrieval_question, kbinfos["chunks"], tenant_ids, chat_mdl, dialog.top_n)
                 if cks:
                     kbinfos["chunks"] = cks
-            kbinfos["chunks"] = retriever.retrieval_by_children(kbinfos["chunks"], tenant_ids)
+            if not multi_task_retrieval:
+                kbinfos["chunks"] = retriever.retrieval_by_children(kbinfos["chunks"], tenant_ids)
         if use_web_search:
             web_search = create_web_search_provider(prompt_config)
             web_res = web_search.retrieve_chunks(" ".join(questions))

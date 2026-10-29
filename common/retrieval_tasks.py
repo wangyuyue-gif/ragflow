@@ -160,24 +160,57 @@ def _chunk_key(chunk: dict) -> tuple:
     )
 
 
-def merge_task_results(task_results: list[dict], top_n: int) -> dict:
+def _task_context(task: RetrievalTask) -> dict:
+    return {
+        "query": task.query,
+        "models": list(task.models),
+        "knowledge_types": list(task.knowledge_types),
+    }
+
+
+def _merge_task_contexts(target: dict, source: dict) -> None:
+    contexts = target.setdefault("retrieval_tasks", [])
+    for context in source.get("retrieval_tasks") or []:
+        if context not in contexts:
+            contexts.append(context)
+
+
+def merge_task_results(task_results: list[dict], top_n: int, tasks: list[RetrievalTask] | None = None) -> dict:
     """Merge independently ranked task results while preserving task coverage."""
     if top_n <= 0 or not task_results:
         return {"total": 0, "chunks": [], "doc_aggs": []}
 
-    quota = max(1, top_n // len(task_results))
+    if tasks is not None and len(tasks) != len(task_results):
+        raise ValueError("tasks and task_results must have the same length")
+
+    prepared_results = []
+    for task_index, result in enumerate(task_results):
+        prepared = dict(result)
+        prepared["chunks"] = []
+        for raw_chunk in result.get("chunks") or []:
+            chunk = dict(raw_chunk)
+            if tasks is not None:
+                chunk["retrieval_tasks"] = [_task_context(tasks[task_index])]
+            prepared["chunks"].append(chunk)
+        prepared_results.append(prepared)
+
+    quota = max(1, top_n // len(prepared_results))
     selected = []
+    selected_by_key = {}
     selected_keys = set()
 
     def add_chunk(chunk: dict) -> bool:
         key = _chunk_key(chunk)
         if key in selected_keys:
+            _merge_task_contexts(selected_by_key[key], chunk)
             return False
         selected_keys.add(key)
-        selected.append(dict(chunk))
+        copied_chunk = dict(chunk)
+        selected.append(copied_chunk)
+        selected_by_key[key] = copied_chunk
         return True
 
-    for result in task_results:
+    for result in prepared_results:
         accepted = 0
         for chunk in result.get("chunks") or []:
             if add_chunk(chunk):
@@ -186,7 +219,7 @@ def merge_task_results(task_results: list[dict], top_n: int) -> dict:
                 break
 
     remaining = []
-    for task_index, result in enumerate(task_results):
+    for task_index, result in enumerate(prepared_results):
         for local_rank, chunk in enumerate(result.get("chunks") or []):
             if _chunk_key(chunk) in selected_keys:
                 continue
@@ -234,4 +267,4 @@ async def retrieve_and_merge_tasks(
             return await retrieve_task(task, per_task_top_n)
 
     results = await asyncio.gather(*(bounded_retrieve(task) for task in tasks))
-    return merge_task_results(results, top_n)
+    return merge_task_results(results, top_n, tasks)

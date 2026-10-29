@@ -87,6 +87,37 @@ def test_merge_deduplicates_chunks_and_fills_freed_slots():
     assert merged["total"] == 4
 
 
+def test_merge_labels_chunks_with_their_retrieval_task():
+    tasks = [
+        RetrievalTask(query="LW500HV-GIV 发动机油周期", models=("LW500HV-GIV",)),
+        RetrievalTask(query="XE155D 发动机油周期", models=("XE155D",)),
+    ]
+    first = {"chunks": [_chunk("a0", 0.9, "manual-a")]}
+    second = {"chunks": [_chunk("b0", 0.8, "manual-b")]}
+
+    merged = merge_task_results([first, second], top_n=2, tasks=tasks)
+
+    assert merged["chunks"][0]["retrieval_tasks"] == [
+        {"query": "LW500HV-GIV 发动机油周期", "models": ["LW500HV-GIV"], "knowledge_types": []}
+    ]
+    assert merged["chunks"][1]["retrieval_tasks"] == [
+        {"query": "XE155D 发动机油周期", "models": ["XE155D"], "knowledge_types": []}
+    ]
+
+
+def test_merge_keeps_all_task_labels_when_a_chunk_is_shared():
+    tasks = [
+        RetrievalTask(query="XC975EV 操作", models=("XC975EV",), knowledge_types=("操作",)),
+        RetrievalTask(query="XC975EV 维修", models=("XC975EV",), knowledge_types=("维修",)),
+    ]
+    shared = _chunk("shared", 0.9, "shared-manual")
+
+    merged = merge_task_results([{"chunks": [shared]}, {"chunks": [shared]}], top_n=2, tasks=tasks)
+
+    assert merged["total"] == 1
+    assert [item["knowledge_types"] for item in merged["chunks"][0]["retrieval_tasks"]] == [["操作"], ["维修"]]
+
+
 @pytest.mark.asyncio
 async def test_retrieves_each_task_independently_before_merging():
     tasks = [
@@ -104,3 +135,4 @@ async def test_retrieves_each_task_independently_before_merging():
 
     assert calls == [("XC938U 操作", 6), ("XC975EV 维修", 6)]
     assert [chunk["chunk_id"] for chunk in merged["chunks"]] == ["a0", "a1", "a2", "b0", "b1", "b2"]
+    assert all(chunk["retrieval_tasks"] for chunk in merged["chunks"])
