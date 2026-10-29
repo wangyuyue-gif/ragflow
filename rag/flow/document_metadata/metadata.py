@@ -15,15 +15,10 @@
 #
 
 import re
-import unicodedata
 from collections.abc import Iterable
 from pathlib import Path
 
-from rag.flow.document_metadata.model_registry import MODEL_GROUPS
-
-_UNICODE_HYPHENS = str.maketrans({char: "-" for char in "‐‑‒–—―﹘﹣－"})
-_XC_MODEL_PATTERN = re.compile(r"(?<![A-Z0-9])XC[A-Z0-9]+(?:-[A-Z0-9]+)*(?![A-Z0-9])", re.IGNORECASE)
-_SPECIAL_MODEL_PATTERN = re.compile(r"(?<![A-Z0-9])\d{3,4}\([A-Z]{2,}\)[A-Z0-9]+(?:\.[A-Z0-9]+)+(?![A-Z0-9])", re.IGNORECASE)
+from rag.utils.xcmg_models import find_model_mentions, normalize_text
 
 _DOCUMENT_TYPES = (
     (re.compile(r"控制系统使用说明书"), "控制系统使用说明书", ("操作",)),
@@ -57,44 +52,7 @@ def _append_unique(target: list[str], values: Iterable[str]) -> None:
 
 def _normalize_filename(filename: str) -> str:
     name = Path(str(filename or "")).name
-    return unicodedata.normalize("NFKC", name).translate(_UNICODE_HYPHENS)
-
-
-def _normalize_model_key(model: str) -> str:
-    normalized = unicodedata.normalize("NFKC", str(model or "")).translate(_UNICODE_HYPHENS)
-    return re.sub(r"[\s-]+", "", normalized).upper()
-
-
-def _build_model_lookup() -> dict[str, dict]:
-    lookup = {}
-    for group in MODEL_GROUPS:
-        for model in (*group["official_models"], *group["aliases"]):
-            key = _normalize_model_key(model)
-            previous = lookup.get(key)
-            if previous is not None and previous is not group:
-                raise ValueError(f"Duplicate model registry key: {model}")
-            lookup[key] = group
-    return lookup
-
-
-_MODEL_LOOKUP = _build_model_lookup()
-
-
-def _extract_model_tokens(filename: str) -> list[str]:
-    matches = []
-    for pattern in (_XC_MODEL_PATTERN, _SPECIAL_MODEL_PATTERN):
-        matches.extend((match.start(), match.group(0).upper()) for match in pattern.finditer(filename))
-    matches.sort(key=lambda item: item[0])
-
-    tokens = []
-    seen = set()
-    for _, token in matches:
-        key = _normalize_model_key(token)
-        if key in seen:
-            continue
-        seen.add(key)
-        tokens.append(token)
-    return tokens
+    return normalize_text(name)
 
 
 def _detect_document_type(filename: str) -> tuple[str | None, list[str]]:
@@ -129,14 +87,11 @@ def extract_document_metadata(filename: str) -> dict:
     model_aliases = []
     equipment_types = []
 
-    for token in _extract_model_tokens(normalized_name):
-        group = _MODEL_LOOKUP.get(_normalize_model_key(token))
-        if group is None:
-            _append_unique(models, (token,))
-            continue
-        _append_unique(models, group["official_models"])
-        _append_unique(model_aliases, group["aliases"])
-        _append_unique(equipment_types, (group["equipment_type"],))
+    for mention in find_model_mentions(normalized_name):
+        _append_unique(models, mention.official_models)
+        _append_unique(model_aliases, mention.aliases)
+        if mention.equipment_type:
+            _append_unique(equipment_types, (mention.equipment_type,))
 
     for marker, equipment_type in _EQUIPMENT_TYPES:
         if marker in normalized_name:

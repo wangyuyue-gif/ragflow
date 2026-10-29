@@ -36,7 +36,8 @@ from api.db.services.knowledgebase_service import KnowledgebaseService, validate
 from api.db.services.langfuse_service import TenantLangfuseService
 from api.db.services.llm_service import LLMBundle, resolve_llm_setting
 from api.db.services.user_service import TenantService
-from common.metadata_utils import apply_meta_data_filter
+from common.metadata_utils import apply_meta_data_filter, filter_doc_ids_by_metadata
+from common.retrieval_tasks import retrieve_and_merge_tasks, split_retrieval_tasks
 from api.utils.reference_metadata_utils import (
     enrich_chunks_with_document_metadata,
     resolve_reference_metadata_preferences,
@@ -655,6 +656,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
 
     retriever = settings.retriever
     questions = [m["content"] for m in messages if m["role"] == "user"][-3:]
+    initial_retrieval_tasks = split_retrieval_tasks(questions[-1])
 
     # Get scoped_doc_ids
     scoped_doc_ids = None
@@ -662,7 +664,12 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         scoped_doc_ids = [doc_id for doc_id in kwargs["doc_ids"].split(",") if doc_id]
     if "doc_ids" in messages[-1]:
         scoped_doc_ids = [doc_id for doc_id in messages[-1]["doc_ids"] if doc_id]
-    if dialog.meta_data_filter:
+    defer_generated_metadata_filter = (
+        len(initial_retrieval_tasks) > 1
+        and isinstance(dialog.meta_data_filter, dict)
+        and dialog.meta_data_filter.get("method") in {"auto", "semi_auto"}
+    )
+    if dialog.meta_data_filter and not defer_generated_metadata_filter:
         scoped_doc_ids = await apply_meta_data_filter(
             dialog.meta_data_filter,
             None,
@@ -754,24 +761,86 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         tenant_ids = list(set([kb.tenant_id for kb in kbs]))
         knowledges = []
         if embd_mdl:
-            kbinfos = await retriever.retrieval(
-                " ".join(questions),
-                embd_mdl,
-                tenant_ids,
-                dialog.kb_ids,
-                1,
-                dialog.top_n,
-                dialog.similarity_threshold,
-                dialog.vector_similarity_weight,
-                doc_ids=scoped_doc_ids,
-                knn_top_k=dialog.top_k,
-                aggs=True,
-                rerank_mdl=rerank_mdl,
-                rank_feature=label_question(" ".join(questions), kbs),
-                rerank_candidates_count=rerank_candidates_count,
-            )
+            retrieval_question = " ".join(questions)
+            retrieval_tasks = split_retrieval_tasks(retrieval_question)
+            if len(retrieval_tasks) > 1:
+                if len(retrieval_tasks) > dialog.top_n:
+                    logging.warning(
+                        "Retrieval task count exceeds Top N; truncating tasks: task_count=%d top_n=%d",
+                        len(retrieval_tasks),
+                        dialog.top_n,
+                    )
+                    retrieval_tasks = retrieval_tasks[: dialog.top_n]
+
+                metadata_cache = None
+
+                def load_metadata():
+                    nonlocal metadata_cache
+                    if metadata_cache is None:
+                        metadata_cache = DocMetadataService.get_flatted_meta_by_kbs(dialog.kb_ids)
+                    return metadata_cache
+
+                async def retrieve_task(task, task_top_n):
+                    task_doc_ids = scoped_doc_ids
+                    if task.models:
+                        model_conditions = [{"key": "models", "op": "contains", "value": model} for model in task.models]
+                        task_doc_ids = filter_doc_ids_by_metadata(dialog.kb_ids, model_conditions, "or", load_metadata)
+                        if scoped_doc_ids is not None:
+                            allowed_doc_ids = set(scoped_doc_ids)
+                            task_doc_ids = [doc_id for doc_id in task_doc_ids if doc_id in allowed_doc_ids]
+                        if not task_doc_ids:
+                            task_doc_ids = ["-999"]
+
+                    logging.debug(
+                        "Multi-task retrieval: query=%r models=%s knowledge_types=%s doc_count=%d top_n=%d",
+                        task.query,
+                        task.models,
+                        task.knowledge_types,
+                        len(task_doc_ids or []),
+                        task_top_n,
+                    )
+                    return await retriever.retrieval(
+                        task.query,
+                        embd_mdl,
+                        tenant_ids,
+                        dialog.kb_ids,
+                        1,
+                        task_top_n,
+                        dialog.similarity_threshold,
+                        dialog.vector_similarity_weight,
+                        doc_ids=task_doc_ids,
+                        knn_top_k=dialog.top_k,
+                        aggs=False,
+                        rerank_mdl=rerank_mdl,
+                        rank_feature=label_question(task.query, kbs),
+                        rerank_candidates_count=rerank_candidates_count,
+                    )
+
+                kbinfos = await retrieve_and_merge_tasks(
+                    retrieval_tasks,
+                    dialog.top_n,
+                    rerank_candidates_count,
+                    retrieve_task,
+                )
+            else:
+                kbinfos = await retriever.retrieval(
+                    retrieval_question,
+                    embd_mdl,
+                    tenant_ids,
+                    dialog.kb_ids,
+                    1,
+                    dialog.top_n,
+                    dialog.similarity_threshold,
+                    dialog.vector_similarity_weight,
+                    doc_ids=scoped_doc_ids,
+                    knn_top_k=dialog.top_k,
+                    aggs=True,
+                    rerank_mdl=rerank_mdl,
+                    rank_feature=label_question(retrieval_question, kbs),
+                    rerank_candidates_count=rerank_candidates_count,
+                )
             if prompt_config.get("toc_enhance"):
-                cks = await retriever.retrieval_by_toc(" ".join(questions), kbinfos["chunks"], tenant_ids, chat_mdl, dialog.top_n)
+                cks = await retriever.retrieval_by_toc(retrieval_question, kbinfos["chunks"], tenant_ids, chat_mdl, dialog.top_n)
                 if cks:
                     kbinfos["chunks"] = cks
             kbinfos["chunks"] = retriever.retrieval_by_children(kbinfos["chunks"], tenant_ids)
