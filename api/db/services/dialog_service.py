@@ -37,7 +37,7 @@ from api.db.services.langfuse_service import TenantLangfuseService
 from api.db.services.llm_service import LLMBundle, resolve_llm_setting
 from api.db.services.user_service import TenantService
 from common.metadata_utils import apply_meta_data_filter, filter_doc_ids_by_metadata
-from common.retrieval_tasks import retrieve_and_merge_tasks, split_retrieval_tasks
+from common.retrieval_tasks import expand_retrieval_query, retrieve_and_merge_tasks, split_retrieval_tasks
 from api.utils.reference_metadata_utils import (
     enrich_chunks_with_document_metadata,
     resolve_reference_metadata_preferences,
@@ -782,6 +782,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     return metadata_cache
 
                 async def retrieve_task(task, task_top_n):
+                    task_search_query = expand_retrieval_query(task.query)
                     task_doc_ids = scoped_doc_ids
                     if task.models:
                         model_conditions = [{"key": "models", "op": "contains", "value": model} for model in task.models]
@@ -793,15 +794,16 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                             task_doc_ids = ["-999"]
 
                     logging.debug(
-                        "Multi-task retrieval: query=%r models=%s knowledge_types=%s doc_count=%d top_n=%d",
+                        "Multi-task retrieval: query=%r expanded_query=%r models=%s knowledge_types=%s doc_count=%d top_n=%d",
                         task.query,
+                        task_search_query,
                         task.models,
                         task.knowledge_types,
                         len(task_doc_ids or []),
                         task_top_n,
                     )
                     task_result = await retriever.retrieval(
-                        task.query,
+                        task_search_query,
                         embd_mdl,
                         tenant_ids,
                         dialog.kb_ids,
@@ -813,11 +815,11 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                         knn_top_k=dialog.top_k,
                         aggs=False,
                         rerank_mdl=rerank_mdl,
-                        rank_feature=label_question(task.query, kbs),
+                        rank_feature=label_question(task_search_query, kbs),
                         rerank_candidates_count=rerank_candidates_count,
                     )
                     if prompt_config.get("toc_enhance"):
-                        toc_chunks = await retriever.retrieval_by_toc(task.query, task_result["chunks"], tenant_ids, chat_mdl, task_top_n)
+                        toc_chunks = await retriever.retrieval_by_toc(task_search_query, task_result["chunks"], tenant_ids, chat_mdl, task_top_n)
                         if toc_chunks:
                             task_result["chunks"] = toc_chunks
                     task_result["chunks"] = retriever.retrieval_by_children(task_result["chunks"], tenant_ids)
@@ -830,8 +832,9 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     retrieve_task,
                 )
             else:
+                retrieval_search_query = expand_retrieval_query(retrieval_question)
                 kbinfos = await retriever.retrieval(
-                    retrieval_question,
+                    retrieval_search_query,
                     embd_mdl,
                     tenant_ids,
                     dialog.kb_ids,
@@ -843,11 +846,11 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     knn_top_k=dialog.top_k,
                     aggs=True,
                     rerank_mdl=rerank_mdl,
-                    rank_feature=label_question(retrieval_question, kbs),
+                    rank_feature=label_question(retrieval_search_query, kbs),
                     rerank_candidates_count=rerank_candidates_count,
                 )
             if not multi_task_retrieval and prompt_config.get("toc_enhance"):
-                cks = await retriever.retrieval_by_toc(retrieval_question, kbinfos["chunks"], tenant_ids, chat_mdl, dialog.top_n)
+                cks = await retriever.retrieval_by_toc(retrieval_search_query, kbinfos["chunks"], tenant_ids, chat_mdl, dialog.top_n)
                 if cks:
                     kbinfos["chunks"] = cks
             if not multi_task_retrieval:

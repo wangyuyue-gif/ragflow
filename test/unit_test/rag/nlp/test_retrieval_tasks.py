@@ -1,6 +1,6 @@
 import pytest
 
-from common.retrieval_tasks import RetrievalTask, merge_task_results, retrieve_and_merge_tasks, split_retrieval_tasks
+from common.retrieval_tasks import RetrievalTask, expand_retrieval_query, merge_task_results, retrieve_and_merge_tasks, split_retrieval_tasks
 
 
 def test_leaves_question_without_model_as_one_task():
@@ -54,6 +54,28 @@ def test_keeps_unknown_models_separate_without_alias_guessing():
     tasks = split_retrieval_tasks("XC999D和XC888D怎么维修？")
 
     assert [task.models for task in tasks] == [("XC999D",), ("XC888D",)]
+
+
+def test_expands_engine_oil_terms_for_retrieval_only():
+    expanded = expand_retrieval_query("XE155D发动机机油多久更换？")
+
+    assert expanded.startswith("XE155D发动机机油多久更换?")
+    assert all(term in expanded for term in ("发动机机油", "发动机油", "柴油机润滑油"))
+
+
+def test_expands_hydraulic_tank_amount_terms_conservatively():
+    expanded = expand_retrieval_query("LW500HV-GIV液压油箱容量是多少？")
+
+    assert expanded.startswith("LW500HV-GIV液压油箱容量是多少?")
+    assert all(term in expanded for term in ("液压油箱容量", "液压油箱加油量", "液压油用量", "液压油定量"))
+
+
+def test_does_not_expand_unrelated_capacity_question():
+    assert expand_retrieval_query("LW500HV-GIV燃油箱容量是多少？") == "LW500HV-GIV燃油箱容量是多少?"
+
+
+def test_does_not_expand_engine_oil_pressure_question():
+    assert expand_retrieval_query("XE155D发动机油压过低怎么办？") == "XE155D发动机油压过低怎么办?"
 
 
 def _chunk(chunk_id, similarity, doc_name):
