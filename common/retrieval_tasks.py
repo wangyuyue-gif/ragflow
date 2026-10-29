@@ -43,16 +43,6 @@ _INTENT_MAP = {
     "安装": "拆装",
 }
 
-_ENGINE_OIL_TERMS = ("发动机机油", "发动机油", "柴油机润滑油")
-_HYDRAULIC_TANK_AMOUNT_TERMS = (
-    "液压油箱容量",
-    "液压油箱加注容量",
-    "液压油箱加油量",
-    "液压油加注量",
-    "液压油用量",
-    "液压油定量",
-)
-
 
 @dataclass(frozen=True)
 class RetrievalTask:
@@ -60,30 +50,6 @@ class RetrievalTask:
     models: tuple[str, ...] = ()
     model_aliases: tuple[str, ...] = ()
     knowledge_types: tuple[str, ...] = ()
-
-
-def _append_missing_terms(query: str, terms: tuple[str, ...]) -> str:
-    missing = [term for term in terms if term not in query]
-    return " ".join([query, *missing]) if missing else query
-
-
-def expand_retrieval_query(query: str) -> str:
-    """Add narrow XCMG-manual synonyms for retrieval without changing the user question."""
-    expanded = normalize_text(query).strip()
-    if not expanded:
-        return expanded
-
-    asks_engine_oil = "发动机机油" in expanded or "柴油机润滑油" in expanded or bool(re.search(r"发动机油(?!压|温)", expanded))
-    if asks_engine_oil:
-        expanded = _append_missing_terms(expanded, _ENGINE_OIL_TERMS)
-
-    asks_hydraulic_tank_amount = "液压油" in expanded and any(
-        marker in expanded for marker in ("容量", "加油量", "加注量", "用量", "定量")
-    )
-    if asks_hydraulic_tank_amount:
-        expanded = _append_missing_terms(expanded, _HYDRAULIC_TANK_AMOUNT_TERMS)
-
-    return expanded
 
 
 def _unique_model_groups(mentions: list[ModelMention]) -> list[ModelMention]:
