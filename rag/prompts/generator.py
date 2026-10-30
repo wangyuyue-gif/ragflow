@@ -157,17 +157,6 @@ def _kb_block(ck, index: int, hash_id: bool = False) -> str | None:
     cnt = "\nID: {}".format(index if not hash_id else hash_str2int(get_value(ck, "id", "chunk_id"), 500))
     cnt += draw_node("Title", get_value(ck, "docnm_kwd", "document_name"))
     cnt += draw_node("URL", ck.get("url", ""))
-    for task in ck.get("retrieval_tasks") or []:
-        if not isinstance(task, dict):
-            continue
-        task_parts = []
-        if task.get("models"):
-            task_parts.append("models=" + ", ".join(str(model) for model in task["models"]))
-        if task.get("knowledge_types"):
-            task_parts.append("knowledge_types=" + ", ".join(str(item) for item in task["knowledge_types"]))
-        if task.get("query"):
-            task_parts.append("query=" + str(task["query"]))
-        cnt += draw_node("Retrieval task", "; ".join(task_parts))
     meta = ck.get("document_metadata") or {}
     for k, v in meta.items():
         cnt += draw_node(k, v)

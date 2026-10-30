@@ -87,7 +87,7 @@ class TestKbPromptDocumentMetadata:
         assert "year: 2026" in rendered[0]
 
     @pytest.mark.p1
-    def test_retrieval_task_context_is_rendered_before_chunk_content(self):
+    def test_retrieval_task_context_is_not_exposed_to_answer_model(self):
         kbinfos = {
             "chunks": [
                 {
@@ -107,8 +107,9 @@ class TestKbPromptDocumentMetadata:
 
         rendered = kb_prompt(kbinfos, max_tokens=10000)
 
-        assert "Retrieval task: models=XE155D; knowledge_types=保养; query=XE155D 发动机油更换周期" in rendered[0]
-        assert rendered[0].index("Retrieval task:") < rendered[0].index("Content:")
+        assert "Retrieval task:" not in rendered[0]
+        assert "XE155D 发动机油更换周期" not in rendered[0]
+        assert "每500小时更换" in rendered[0]
 
 
 @pytest.mark.p1

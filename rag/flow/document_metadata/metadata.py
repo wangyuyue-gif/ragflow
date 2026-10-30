@@ -19,7 +19,10 @@
 import re
 import unicodedata
 from collections.abc import Iterable
+from copy import deepcopy
 from pathlib import Path
+
+from common.metadata_utils import update_metadata_to
 
 _UNICODE_HYPHENS = str.maketrans({char: "-" for char in "‐‑‒–—―﹘﹣－"})
 
@@ -130,6 +133,6 @@ def attach_document_metadata(chunks: list[dict] | None, filename: str) -> list[d
     metadata = extract_document_metadata(filename)
     existing = output[0].get("metadata")
     if isinstance(existing, dict):
-        metadata = {**existing, **metadata}
+        metadata = update_metadata_to(deepcopy(existing), metadata)
     output[0]["metadata"] = metadata
     return output

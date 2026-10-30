@@ -101,3 +101,25 @@ def test_attaches_metadata_only_to_first_chunk_without_mutating_input():
     }
     assert "metadata" not in output[1]
     assert all("metadata" not in chunk for chunk in chunks)
+
+
+def test_merges_filename_metadata_with_existing_string_arrays():
+    chunks = [
+        {
+            "text": "first",
+            "metadata": {
+                "models": ["XE155D", "XE155DK"],
+                "systems": ["发动机"],
+            },
+        }
+    ]
+
+    output = attach_document_metadata(chunks, "XE155D液压挖掘机操作手册.docx")
+
+    assert output[0]["metadata"] == {
+        "models": ["XE155D", "XE155DK"],
+        "systems": ["发动机"],
+        "equipment_type": ["液压挖掘机"],
+        "manual_type": ["操作方法"],
+    }
+    assert chunks[0]["metadata"]["models"] == ["XE155D", "XE155DK"]

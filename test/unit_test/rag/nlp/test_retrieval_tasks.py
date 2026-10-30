@@ -3,11 +3,11 @@ import pytest
 from common.retrieval_tasks import RetrievalTask, merge_task_results, retrieve_and_merge_tasks, validate_subquestions
 
 
-def _chunk(chunk_id, similarity, doc_name):
+def _chunk(chunk_id, similarity, doc_name, doc_id=None):
     return {
         "chunk_id": chunk_id,
         "similarity": similarity,
-        "doc_id": f"doc-{doc_name}",
+        "doc_id": doc_id or f"doc-{doc_name}",
         "docnm_kwd": doc_name,
         "content_with_weight": chunk_id,
     }
@@ -103,6 +103,48 @@ def test_merge_deduplicates_shared_coverage_and_uses_next_distinct_chunk():
     merged = merge_task_results([first, second], top_n=2, tasks=tasks)
 
     assert [chunk["chunk_id"] for chunk in merged["chunks"]] == ["shared", "b1"]
+
+
+def test_subquestion_coverage_prefers_an_unseen_document():
+    tasks = [RetrievalTask(query="question a"), RetrievalTask(query="question b")]
+    first = {"chunks": [_chunk("a0", 0.9, "manual-a", "doc-a")]}
+    second = {
+        "chunks": [
+            _chunk("a1", 0.95, "manual-a", "doc-a"),
+            _chunk("b0", 0.8, "manual-b", "doc-b"),
+        ]
+    }
+
+    merged = merge_task_results([first, second], top_n=2, tasks=tasks)
+
+    assert [chunk["chunk_id"] for chunk in merged["chunks"]] == ["a0", "b0"]
+
+
+def test_same_filename_documents_are_aggregated_by_document_id():
+    tasks = [RetrievalTask(query="question a"), RetrievalTask(query="question b")]
+    first = {"chunks": [_chunk("a0", 0.9, "manual.docx", "doc-a")]}
+    second = {"chunks": [_chunk("b0", 0.8, "manual.docx", "doc-b")]}
+
+    merged = merge_task_results([first, second], top_n=2, tasks=tasks)
+
+    assert merged["doc_aggs"] == [
+        {"doc_name": "manual.docx", "doc_id": "doc-a", "count": 1},
+        {"doc_name": "manual.docx", "doc_id": "doc-b", "count": 1},
+    ]
+
+
+def test_fused_chunks_expose_rrf_score_separately_from_local_similarity():
+    tasks = [RetrievalTask(query="question a"), RetrievalTask(query="question b")]
+    shared = _chunk("shared", 0.2, "manual")
+
+    merged = merge_task_results(
+        [{"chunks": [shared]}, {"chunks": [shared]}],
+        top_n=1,
+        tasks=tasks,
+    )
+
+    assert merged["chunks"][0]["similarity"] == 0.2
+    assert merged["chunks"][0]["fusion_score"] == pytest.approx(2 / 61)
 
 
 @pytest.mark.asyncio

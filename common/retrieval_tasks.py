@@ -124,7 +124,7 @@ async def plan_retrieval_tasks(
             timeout=max(1.0, float(timeout_seconds)),
         )
         return validate_subquestions(question, result, max_subquestions)
-    except Exception:  # noqa: BLE001 - planner failure must not block retrieval
+    except Exception:  # Planner failure must not block retrieval.
         logger.warning("Query decomposition failed; using the original retrieval path", exc_info=True)
         return []
 
@@ -137,6 +137,10 @@ def _chunk_key(chunk: dict) -> tuple:
         str(chunk.get("doc_id") or ""),
         str(chunk.get("content_with_weight") or ""),
     )
+
+
+def _document_id(chunk: dict) -> str:
+    return str(chunk.get("doc_id") or "")
 
 
 def _task_context(task: RetrievalTask) -> dict:
@@ -184,22 +188,38 @@ def merge_task_results(task_results: list[dict], top_n: int, tasks: list[Retriev
 
     selected_keys = []
     selected_set = set()
+    selected_doc_ids = set()
 
     def select(key) -> bool:
         if key in selected_set or key not in candidates or len(selected_keys) >= top_n:
             return False
         selected_set.add(key)
         selected_keys.append(key)
+        doc_id = _document_id(candidates[key]["chunk"])
+        if doc_id:
+            selected_doc_ids.add(doc_id)
         return True
 
-    # Guarantee one distinct result per planned sub-question when one exists.
+    # Protect one result per planned sub-question. Prefer a document that has not
+    # yet been represented, then fall back to another chunk from an already
+    # selected document when the branch has no alternative document.
     # The original-query safety search participates only in the fill phase.
     for task, keys in zip(tasks, ranked_keys):
         if task.is_original:
             continue
-        for key in keys:
-            if select(key):
-                break
+        unseen_document_key = next(
+            (
+                key
+                for key in keys
+                if key not in selected_set
+                and _document_id(candidates[key]["chunk"])
+                and _document_id(candidates[key]["chunk"]) not in selected_doc_ids
+            ),
+            None,
+        )
+        if unseen_document_key is not None and select(unseen_document_key):
+            continue
+        next((key for key in keys if select(key)), None)
 
     fused_keys = sorted(
         candidates,
@@ -210,21 +230,25 @@ def merge_task_results(task_results: list[dict], top_n: int, tasks: list[Retriev
             break
         select(key)
 
-    selected = [candidates[key]["chunk"] for key in selected_keys]
+    selected = []
+    for key in selected_keys:
+        chunk = candidates[key]["chunk"]
+        chunk["fusion_score"] = candidates[key]["rrf"]
+        selected.append(chunk)
+
     doc_aggs = {}
     for chunk in selected:
         doc_name = str(chunk.get("docnm_kwd") or "")
-        if doc_name not in doc_aggs:
-            doc_aggs[doc_name] = {"doc_id": chunk.get("doc_id") or "", "count": 0}
-        doc_aggs[doc_name]["count"] += 1
+        doc_id = _document_id(chunk)
+        aggregation_key = ("doc_id", doc_id) if doc_id else ("doc_name", doc_name)
+        if aggregation_key not in doc_aggs:
+            doc_aggs[aggregation_key] = {"doc_name": doc_name, "doc_id": doc_id, "count": 0}
+        doc_aggs[aggregation_key]["count"] += 1
 
     return {
         "total": len(selected),
         "chunks": selected,
-        "doc_aggs": [
-            {"doc_name": name, "doc_id": values["doc_id"], "count": values["count"]}
-            for name, values in doc_aggs.items()
-        ],
+        "doc_aggs": list(doc_aggs.values()),
     }
 
 
@@ -250,7 +274,7 @@ async def retrieve_and_merge_tasks(
         async with semaphore:
             try:
                 return await retrieve_task(task, task_top_n)
-            except Exception:  # noqa: BLE001 - one failed branch must not cancel siblings
+            except Exception:  # One failed branch must not cancel siblings.
                 logger.warning("Retrieval task failed: %r", task.query, exc_info=True)
                 return {"total": 0, "chunks": [], "doc_aggs": []}
 
