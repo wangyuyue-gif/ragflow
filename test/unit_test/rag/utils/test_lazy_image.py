@@ -2,7 +2,7 @@ from io import BytesIO
 
 from PIL import Image
 
-from rag.utils.lazy_image import LazyImage, flatten_to_rgb
+from rag.utils.lazy_image import LazyImage, flatten_to_rgb, stack_images_vertically
 
 
 def _png_bytes(image):
@@ -50,3 +50,14 @@ def test_lazy_image_uses_white_for_transparent_pixels():
 
     assert flattened.mode == "RGB"
     assert flattened.getpixel((0, 0)) == (255, 255, 255)
+
+
+def test_vertical_stack_uses_white_for_transparent_pixels():
+    transparent = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    opaque = Image.new("RGB", (1, 1), (255, 0, 0))
+
+    stacked = stack_images_vertically(transparent, opaque)
+
+    assert stacked.mode == "RGB"
+    assert stacked.getpixel((0, 0)) == (255, 255, 255)
+    assert stacked.getpixel((0, 1)) == (255, 0, 0)

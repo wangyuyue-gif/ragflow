@@ -19,6 +19,22 @@ def flatten_to_rgb(img):
     return img.convert("RGB")
 
 
+def stack_images_vertically(img1, img2):
+    """Stack two PIL images on a white RGB canvas without black transparency."""
+    flat1 = flatten_to_rgb(img1)
+    flat2 = flatten_to_rgb(img2)
+    width1, height1 = flat1.size
+    width2, height2 = flat2.size
+    canvas = Image.new("RGB", (max(width1, width2), height1 + height2), (255, 255, 255))
+    canvas.paste(flat1, (0, 0))
+    canvas.paste(flat2, (0, height1))
+    if flat1 is not img1:
+        flat1.close()
+    if flat2 is not img2:
+        flat2.close()
+    return canvas
+
+
 class LazyImage:
     def __init__(self, blobs, source=None):
         self._blobs = [b for b in (blobs or []) if b]
