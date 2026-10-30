@@ -1,59 +1,6 @@
 import pytest
 
-from common.retrieval_tasks import RetrievalTask, merge_task_results, retrieve_and_merge_tasks, split_retrieval_tasks
-
-
-def test_leaves_question_without_model_as_one_task():
-    assert split_retrieval_tasks("液压油多久更换一次？") == [RetrievalTask(query="液压油多久更换一次?")]
-
-
-def test_splits_two_models_asking_for_same_fact():
-    tasks = split_retrieval_tasks("LW500HV-GIV发动机机油和XE155D发动机机油的更换周期分别是什么？")
-
-    assert [task.models for task in tasks] == [("LW500HV-GIV",), ("XE155D",)]
-    assert all("发动机机油的更换周期分别是什么?" in task.query for task in tasks)
-    assert all(task.query.count("发动机机油") == 1 for task in tasks)
-
-
-def test_splits_one_model_with_operation_and_repair_intents():
-    tasks = split_retrieval_tasks("XC938U怎么操作和维修？")
-
-    assert [task.knowledge_types for task in tasks] == [("操作",), ("维修",)]
-    assert all(task.models == ("XC938U",) for task in tasks)
-
-
-def test_preserves_explicit_model_to_intent_pairing_across_clauses():
-    tasks = split_retrieval_tasks("XC938U怎么操作，XC975EV怎么维修？")
-
-    assert [(task.models, task.knowledge_types) for task in tasks] == [
-        (("XC938U",), ("操作",)),
-        (("XC975EV", "XC975EU"), ("维修",)),
-    ]
-
-
-def test_builds_cartesian_tasks_when_both_models_share_both_intents():
-    tasks = split_retrieval_tasks("XC938U和XC975EV分别怎么操作和维修？")
-
-    assert [(task.models, task.knowledge_types) for task in tasks] == [
-        (("XC938U",), ("操作",)),
-        (("XC938U",), ("维修",)),
-        (("XC975EV", "XC975EU"), ("操作",)),
-        (("XC975EV", "XC975EU"), ("维修",)),
-    ]
-
-
-def test_deduplicates_official_names_for_same_product():
-    tasks = split_retrieval_tasks("XC975EV和XC975EU怎么保养？")
-
-    assert len(tasks) == 1
-    assert tasks[0].models == ("XC975EV", "XC975EU")
-    assert tasks[0].knowledge_types == ("保养",)
-
-
-def test_keeps_unknown_models_separate_without_alias_guessing():
-    tasks = split_retrieval_tasks("XC999D和XC888D怎么维修？")
-
-    assert [task.models for task in tasks] == [("XC999D",), ("XC888D",)]
+from common.retrieval_tasks import RetrievalTask, merge_task_results, retrieve_and_merge_tasks, validate_subquestions
 
 
 def _chunk(chunk_id, similarity, doc_name):
@@ -66,73 +13,138 @@ def _chunk(chunk_id, similarity, doc_name):
     }
 
 
-def test_merge_reserves_quota_for_each_task_before_global_fill():
-    first = {"chunks": [_chunk(f"a{i}", 1.0 - i / 100, "manual-a") for i in range(6)]}
-    second = {"chunks": [_chunk(f"b{i}", 0.5 - i / 100, "manual-b") for i in range(6)]}
+def test_validates_generic_subquestions_without_business_rules():
+    tasks = validate_subquestions(
+        "Compare A and B maintenance intervals",
+        {"sub_questions": ["What is A's maintenance interval?", "What is B's maintenance interval?"]},
+    )
 
-    merged = merge_task_results([first, second], top_n=6)
-
-    assert [chunk["chunk_id"] for chunk in merged["chunks"]] == ["a0", "a1", "a2", "b0", "b1", "b2"]
-    assert {item["doc_name"]: item["count"] for item in merged["doc_aggs"]} == {"manual-a": 3, "manual-b": 3}
-
-
-def test_merge_deduplicates_chunks_and_fills_freed_slots():
-    shared = _chunk("shared", 0.9, "shared-manual")
-    first = {"chunks": [shared, _chunk("a1", 0.8, "manual-a"), _chunk("a2", 0.7, "manual-a")]}
-    second = {"chunks": [shared, _chunk("b1", 0.6, "manual-b"), _chunk("b2", 0.5, "manual-b")]}
-
-    merged = merge_task_results([first, second], top_n=4)
-
-    assert [chunk["chunk_id"] for chunk in merged["chunks"]] == ["shared", "a1", "b1", "b2"]
-    assert merged["total"] == 4
-
-
-def test_merge_labels_chunks_with_their_retrieval_task():
-    tasks = [
-        RetrievalTask(query="LW500HV-GIV 发动机油周期", models=("LW500HV-GIV",)),
-        RetrievalTask(query="XE155D 发动机油周期", models=("XE155D",)),
+    assert tasks == [
+        RetrievalTask(query="What is A's maintenance interval?"),
+        RetrievalTask(query="What is B's maintenance interval?"),
     ]
-    first = {"chunks": [_chunk("a0", 0.9, "manual-a")]}
-    second = {"chunks": [_chunk("b0", 0.8, "manual-b")]}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"sub_questions": "not-a-list"},
+        {"sub_questions": ["only one rewrite"]},
+        {"sub_questions": ["same question", "same question"]},
+    ],
+)
+def test_invalid_or_non_decomposed_plans_fall_back(payload):
+    assert validate_subquestions("original question", payload) == []
+
+
+def test_drops_original_duplicates_and_caps_task_count():
+    tasks = validate_subquestions(
+        "original question",
+        {
+            "sub_questions": [
+                "Original question!",
+                "first aspect",
+                "second aspect",
+                "third aspect",
+                "fourth aspect",
+            ]
+        },
+        max_subquestions=3,
+    )
+
+    assert [task.query for task in tasks] == ["first aspect", "second aspect", "third aspect"]
+
+
+def test_merge_guarantees_one_distinct_chunk_per_subquestion():
+    tasks = [
+        RetrievalTask(query="question a"),
+        RetrievalTask(query="question b"),
+        RetrievalTask(query="original", is_original=True),
+    ]
+    first = {"chunks": [_chunk(f"a{i}", 1.0 - i / 100, "manual-a") for i in range(5)]}
+    # Deliberately much lower raw similarities: cross-query selection must still
+    # preserve this branch instead of treating those scores as calibrated.
+    second = {"chunks": [_chunk(f"b{i}", 0.1 - i / 100, "manual-b") for i in range(5)]}
+    original = {"chunks": [_chunk(f"o{i}", 0.99 - i / 100, "manual-o") for i in range(5)]}
+
+    merged = merge_task_results([first, second, original], top_n=4, tasks=tasks)
+
+    assert merged["chunks"][0]["chunk_id"] == "a0"
+    assert merged["chunks"][1]["chunk_id"] == "b0"
+    assert {chunk["docnm_kwd"] for chunk in merged["chunks"]} >= {"manual-a", "manual-b"}
+
+
+def test_rrf_rewards_chunks_supported_by_multiple_queries():
+    tasks = [
+        RetrievalTask(query="question a"),
+        RetrievalTask(query="question b"),
+        RetrievalTask(query="original", is_original=True),
+    ]
+    shared = _chunk("shared", 0.2, "shared-manual")
+    first = {"chunks": [_chunk("a0", 0.9, "manual-a"), shared]}
+    second = {"chunks": [_chunk("b0", 0.8, "manual-b"), shared]}
+    original = {"chunks": [shared, _chunk("o1", 0.99, "manual-o")]}
+
+    merged = merge_task_results([first, second, original], top_n=3, tasks=tasks)
+
+    assert [chunk["chunk_id"] for chunk in merged["chunks"]] == ["a0", "b0", "shared"]
+    shared_contexts = merged["chunks"][2]["retrieval_tasks"]
+    assert {item["query"] for item in shared_contexts} == {"question a", "question b", "original"}
+
+
+def test_merge_deduplicates_shared_coverage_and_uses_next_distinct_chunk():
+    tasks = [RetrievalTask(query="question a"), RetrievalTask(query="question b")]
+    shared = _chunk("shared", 0.9, "shared-manual")
+    first = {"chunks": [shared, _chunk("a1", 0.8, "manual-a")]}
+    second = {"chunks": [shared, _chunk("b1", 0.7, "manual-b")]}
 
     merged = merge_task_results([first, second], top_n=2, tasks=tasks)
 
-    assert merged["chunks"][0]["retrieval_tasks"] == [
-        {"query": "LW500HV-GIV 发动机油周期", "models": ["LW500HV-GIV"], "knowledge_types": []}
-    ]
-    assert merged["chunks"][1]["retrieval_tasks"] == [
-        {"query": "XE155D 发动机油周期", "models": ["XE155D"], "knowledge_types": []}
-    ]
-
-
-def test_merge_keeps_all_task_labels_when_a_chunk_is_shared():
-    tasks = [
-        RetrievalTask(query="XC975EV 操作", models=("XC975EV",), knowledge_types=("操作",)),
-        RetrievalTask(query="XC975EV 维修", models=("XC975EV",), knowledge_types=("维修",)),
-    ]
-    shared = _chunk("shared", 0.9, "shared-manual")
-
-    merged = merge_task_results([{"chunks": [shared]}, {"chunks": [shared]}], top_n=2, tasks=tasks)
-
-    assert merged["total"] == 1
-    assert [item["knowledge_types"] for item in merged["chunks"][0]["retrieval_tasks"]] == [["操作"], ["维修"]]
+    assert [chunk["chunk_id"] for chunk in merged["chunks"]] == ["shared", "b1"]
 
 
 @pytest.mark.asyncio
-async def test_retrieves_each_task_independently_before_merging():
-    tasks = [
-        RetrievalTask(query="XC938U 操作", models=("XC938U",), knowledge_types=("操作",)),
-        RetrievalTask(query="XC975EV 维修", models=("XC975EV", "XC975EU"), knowledge_types=("维修",)),
-    ]
+async def test_retrieves_subquestions_and_original_safety_query():
+    sub_tasks = [RetrievalTask(query="question a"), RetrievalTask(query="question b")]
     calls = []
 
     async def fake_retrieve(task, task_top_n):
-        calls.append((task.query, task_top_n))
-        prefix = "a" if task.models == ("XC938U",) else "b"
-        return {"chunks": [_chunk(f"{prefix}{index}", 1 - index / 10, f"manual-{prefix}") for index in range(task_top_n)]}
+        calls.append((task.query, task.is_original, task_top_n))
+        return {"chunks": [_chunk(task.query, 0.5, task.query)]}
 
-    merged = await retrieve_and_merge_tasks(tasks, top_n=6, rerank_candidates_count=64, retrieve_task=fake_retrieve)
+    merged = await retrieve_and_merge_tasks(
+        "original question",
+        sub_tasks,
+        top_n=12,
+        rerank_candidates_count=64,
+        retrieve_task=fake_retrieve,
+    )
 
-    assert calls == [("XC938U 操作", 6), ("XC975EV 维修", 6)]
-    assert [chunk["chunk_id"] for chunk in merged["chunks"]] == ["a0", "a1", "a2", "b0", "b1", "b2"]
-    assert all(chunk["retrieval_tasks"] for chunk in merged["chunks"])
+    assert set(calls) == {
+        ("question a", False, 8),
+        ("question b", False, 8),
+        ("original question", True, 12),
+    }
+    assert merged["total"] == 3
+
+
+@pytest.mark.asyncio
+async def test_one_failed_branch_does_not_cancel_original_or_siblings():
+    sub_tasks = [RetrievalTask(query="failing question"), RetrievalTask(query="working question")]
+
+    async def fake_retrieve(task, _task_top_n):
+        if task.query == "failing question":
+            raise RuntimeError("temporary backend failure")
+        return {"chunks": [_chunk(task.query, 0.5, task.query)]}
+
+    merged = await retrieve_and_merge_tasks(
+        "original question",
+        sub_tasks,
+        top_n=4,
+        rerank_candidates_count=64,
+        retrieve_task=fake_retrieve,
+    )
+
+    assert {chunk["chunk_id"] for chunk in merged["chunks"]} == {"working question", "original question"}

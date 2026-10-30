@@ -14,140 +14,119 @@
 #  limitations under the License.
 #
 
+"""Safe query decomposition and rank-based retrieval fusion for regular chat.
+
+This module deliberately contains no product names, document types, or metadata
+rules. Decomposition only rewrites an information need into independently
+searchable questions. The caller keeps its existing document scope and invokes
+the ordinary retriever for every question.
+"""
+
 import asyncio
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from rag.utils.xcmg_models import ModelMention, find_model_mentions, normalize_text
+logger = logging.getLogger(__name__)
 
-_CLAUSE_BOUNDARY = re.compile(r"[，,；;。]+")
-_LEADING_CONNECTORS = re.compile(r"^[\s和与及、,，;；:：]+")
-_TRAILING_CONNECTORS = re.compile(r"[\s和与及、,，;；:：]+$")
-_DUPLICATE_CONJUNCT = re.compile(r"(?P<term>[\u4e00-\u9fffA-Za-z0-9]+)和(?P=term)")
-_INTENT_PATTERN = re.compile(r"故障维修|故障诊断|故障排查|如何操作|怎么操作|操作|如何使用|怎么用|维修|维护|保养|拆装|拆卸|安装")
-_INTENT_MAP = {
-    "故障维修": "故障维修",
-    "故障诊断": "故障维修",
-    "故障排查": "故障维修",
-    "如何操作": "操作",
-    "怎么操作": "操作",
-    "操作": "操作",
-    "如何使用": "操作",
-    "怎么用": "操作",
-    "维修": "维修",
-    "维护": "保养",
-    "保养": "保养",
-    "拆装": "拆装",
-    "拆卸": "拆装",
-    "安装": "拆装",
-}
+_MAX_QUERY_CHARS = 240
+_DEFAULT_MAX_SUBQUESTIONS = 3
+_DEFAULT_PLANNER_TIMEOUT_SECONDS = 15.0
+_RRF_K = 60
+
+_DECOMPOSITION_PROMPT = """You are a retrieval query planner.
+Decide whether the user's information need must be searched as multiple independent
+questions. Split only when separate subjects, objects, documents, time periods, or
+requested aspects each need their own evidence. A normal single-focus question must
+not be split.
+
+Rules:
+1. Do not answer the question and do not add facts that are absent from it.
+2. Every sub-question must be self-contained and directly searchable in a document
+   corpus. Repeat the necessary subject and constraints instead of using pronouns.
+3. Preserve identifiers, model names, numbers, units, and limiting conditions exactly.
+4. Do not perform terminology expansion or replace the user's words with guessed
+   synonyms.
+5. Produce at most {max_subquestions} sub-questions.
+6. For a single-focus question, return an empty list.
+
+Return JSON only:
+{{"sub_questions": ["...", "..."]}}
+"""
 
 
 @dataclass(frozen=True)
 class RetrievalTask:
     query: str
-    models: tuple[str, ...] = ()
-    model_aliases: tuple[str, ...] = ()
-    knowledge_types: tuple[str, ...] = ()
+    is_original: bool = False
 
 
-def _unique_model_groups(mentions: list[ModelMention]) -> list[ModelMention]:
-    groups = []
-    seen = set()
-    for mention in mentions:
-        key = mention.official_models
-        if key in seen:
-            continue
-        seen.add(key)
-        groups.append(mention)
-    return groups
+def _normalize_for_comparison(text: str) -> str:
+    return re.sub(r"[\W_]+", "", text or "", flags=re.UNICODE).casefold()
 
 
-def _find_intents(text: str) -> list[str]:
-    intents = []
-    for match in _INTENT_PATTERN.finditer(text):
-        intent = _INTENT_MAP[match.group(0)]
-        if intent not in intents:
-            intents.append(intent)
-    return intents
-
-
-def _remove_model_mentions(text: str) -> str:
-    mentions = find_model_mentions(text)
-    if not mentions:
-        return text
-    parts = []
-    cursor = 0
-    for mention in mentions:
-        parts.append(text[cursor : mention.start])
-        cursor = mention.end
-    parts.append(text[cursor:])
-    return "".join(parts)
-
-
-def _build_task_query(source: str, model: ModelMention, intent: str | None) -> str:
-    residual = _remove_model_mentions(source)
-    residual = _INTENT_PATTERN.sub("", residual)
-    residual = _DUPLICATE_CONJUNCT.sub(r"\g<term>", residual)
-    residual = _LEADING_CONNECTORS.sub("", residual)
-    residual = _TRAILING_CONNECTORS.sub("", residual)
-    terms = [model.official_models[0]]
-    if intent:
-        terms.append(intent)
-    if residual:
-        terms.append(residual)
-    return " ".join(terms)
-
-
-def _make_task(source: str, model: ModelMention, intent: str | None = None) -> RetrievalTask:
-    return RetrievalTask(
-        query=_build_task_query(source, model, intent),
-        models=model.official_models,
-        model_aliases=model.aliases,
-        knowledge_types=(intent,) if intent else (),
-    )
-
-
-def _paired_clause_tasks(question: str, model_groups: list[ModelMention]) -> list[RetrievalTask]:
-    tasks = []
-    covered_models = set()
-    for clause in _CLAUSE_BOUNDARY.split(question):
-        clause = clause.strip()
-        if not clause:
-            continue
-        clause_models = _unique_model_groups(find_model_mentions(clause))
-        intents = _find_intents(clause)
-        if len(clause_models) != 1 or not intents:
-            continue
-        model = clause_models[0]
-        covered_models.add(model.official_models)
-        tasks.extend(_make_task(clause, model, intent) for intent in intents)
-
-    expected_models = {model.official_models for model in model_groups}
-    return tasks if len(covered_models) > 1 and covered_models == expected_models else []
-
-
-def split_retrieval_tasks(question: str) -> list[RetrievalTask]:
-    """Split an explicit multi-model or multi-intent question into retrieval tasks."""
-    normalized_question = normalize_text(question).strip()
-    if not normalized_question:
+def validate_subquestions(question: str, payload, max_subquestions: int = _DEFAULT_MAX_SUBQUESTIONS) -> list[RetrievalTask]:
+    """Validate planner output; invalid or non-decomposed output means old-path fallback."""
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("sub_questions")
+    if not isinstance(raw, list):
         return []
 
-    model_groups = _unique_model_groups(find_model_mentions(normalized_question))
-    intents = _find_intents(normalized_question)
-    if not model_groups:
-        return [RetrievalTask(query=normalized_question)]
+    original_key = _normalize_for_comparison(question)
+    tasks = []
+    seen = {original_key}
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        query = " ".join(item.split()).strip()
+        key = _normalize_for_comparison(query)
+        if not query or len(query) > _MAX_QUERY_CHARS or not key or key in seen:
+            continue
+        seen.add(key)
+        tasks.append(RetrievalTask(query=query))
+        if len(tasks) >= max(2, max_subquestions):
+            break
 
-    if len(model_groups) > 1:
-        paired_tasks = _paired_clause_tasks(normalized_question, model_groups)
-        if paired_tasks:
-            return paired_tasks
+    # One rewritten query is not decomposition. Keeping the original retrieval is
+    # safer and avoids paying for two near-identical searches.
+    return tasks if len(tasks) >= 2 else []
 
-    if not intents:
-        return [_make_task(normalized_question, model) for model in model_groups]
 
-    return [_make_task(normalized_question, model, intent) for model in model_groups for intent in intents]
+async def plan_retrieval_tasks(
+    chat_mdl,
+    question: str,
+    max_subquestions: int = _DEFAULT_MAX_SUBQUESTIONS,
+    timeout_seconds: float = _DEFAULT_PLANNER_TIMEOUT_SECONDS,
+) -> list[RetrievalTask]:
+    """Plan independent retrieval tasks, returning ``[]`` on every failure.
+
+    An empty result is intentional: callers must continue through the unchanged
+    single-query retrieval path. Decomposition can therefore improve recall but
+    can never become a prerequisite for answering.
+    """
+    if not question or chat_mdl is None:
+        return []
+    max_subquestions = min(4, max(2, int(max_subquestions)))
+    try:
+        from rag.prompts.generator import gen_json
+
+        result = await asyncio.wait_for(
+            gen_json(
+                _DECOMPOSITION_PROMPT.format(max_subquestions=max_subquestions),
+                f"Question: {question}\nOutput:",
+                chat_mdl,
+                gen_conf={"temperature": 0.0},
+                max_retry=2,
+                raise_on_error=True,
+            ),
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+        return validate_subquestions(question, result, max_subquestions)
+    except Exception:  # noqa: BLE001 - planner failure must not block retrieval
+        logger.warning("Query decomposition failed; using the original retrieval path", exc_info=True)
+        return []
 
 
 def _chunk_key(chunk: dict) -> tuple:
@@ -161,11 +140,7 @@ def _chunk_key(chunk: dict) -> tuple:
 
 
 def _task_context(task: RetrievalTask) -> dict:
-    return {
-        "query": task.query,
-        "models": list(task.models),
-        "knowledge_types": list(task.knowledge_types),
-    }
+    return {"query": task.query, "is_original": task.is_original}
 
 
 def _merge_task_contexts(target: dict, source: dict) -> None:
@@ -175,62 +150,67 @@ def _merge_task_contexts(target: dict, source: dict) -> None:
             contexts.append(context)
 
 
-def merge_task_results(task_results: list[dict], top_n: int, tasks: list[RetrievalTask] | None = None) -> dict:
-    """Merge independently ranked task results while preserving task coverage."""
-    if top_n <= 0 or not task_results:
-        return {"total": 0, "chunks": [], "doc_aggs": []}
+def merge_task_results(task_results: list[dict], top_n: int, tasks: list[RetrievalTask]) -> dict:
+    """Fuse independently ranked results with RRF and protected sub-question coverage.
 
-    if tasks is not None and len(tasks) != len(task_results):
+    Similarity scores from different queries are not calibrated against each other,
+    so they are never used for cross-query ordering. RRF consumes only local ranks.
+    """
+    if top_n <= 0 or not task_results or not tasks:
+        return {"total": 0, "chunks": [], "doc_aggs": []}
+    if len(tasks) != len(task_results):
         raise ValueError("tasks and task_results must have the same length")
 
-    prepared_results = []
-    for task_index, result in enumerate(task_results):
-        prepared = dict(result)
-        prepared["chunks"] = []
-        for raw_chunk in result.get("chunks") or []:
-            chunk = dict(raw_chunk)
-            if tasks is not None:
-                chunk["retrieval_tasks"] = [_task_context(tasks[task_index])]
-            prepared["chunks"].append(chunk)
-        prepared_results.append(prepared)
+    candidates = {}
+    ranked_keys: list[list[tuple]] = []
+    for task, result in zip(tasks, task_results):
+        local_keys = []
+        local_seen = set()
+        for rank, raw_chunk in enumerate(result.get("chunks") or [], start=1):
+            key = _chunk_key(raw_chunk)
+            if key in local_seen:
+                continue
+            local_seen.add(key)
+            local_keys.append(key)
+            if key not in candidates:
+                chunk = dict(raw_chunk)
+                chunk["retrieval_tasks"] = [_task_context(task)]
+                candidates[key] = {"chunk": chunk, "rrf": 0.0, "best_rank": rank}
+            else:
+                _merge_task_contexts(candidates[key]["chunk"], {"retrieval_tasks": [_task_context(task)]})
+                candidates[key]["best_rank"] = min(candidates[key]["best_rank"], rank)
+            candidates[key]["rrf"] += 1.0 / (_RRF_K + rank)
+        ranked_keys.append(local_keys)
 
-    quota = max(1, top_n // len(prepared_results))
-    selected = []
-    selected_by_key = {}
-    selected_keys = set()
+    selected_keys = []
+    selected_set = set()
 
-    def add_chunk(chunk: dict) -> bool:
-        key = _chunk_key(chunk)
-        if key in selected_keys:
-            _merge_task_contexts(selected_by_key[key], chunk)
+    def select(key) -> bool:
+        if key in selected_set or key not in candidates or len(selected_keys) >= top_n:
             return False
-        selected_keys.add(key)
-        copied_chunk = dict(chunk)
-        selected.append(copied_chunk)
-        selected_by_key[key] = copied_chunk
+        selected_set.add(key)
+        selected_keys.append(key)
         return True
 
-    for result in prepared_results:
-        accepted = 0
-        for chunk in result.get("chunks") or []:
-            if add_chunk(chunk):
-                accepted += 1
-            if accepted >= quota or len(selected) >= top_n:
+    # Guarantee one distinct result per planned sub-question when one exists.
+    # The original-query safety search participates only in the fill phase.
+    for task, keys in zip(tasks, ranked_keys):
+        if task.is_original:
+            continue
+        for key in keys:
+            if select(key):
                 break
 
-    remaining = []
-    for task_index, result in enumerate(prepared_results):
-        for local_rank, chunk in enumerate(result.get("chunks") or []):
-            if _chunk_key(chunk) in selected_keys:
-                continue
-            remaining.append((-float(chunk.get("similarity") or 0.0), task_index, local_rank, chunk))
-    remaining.sort(key=lambda item: item[:3])
-
-    for _, _, _, chunk in remaining:
-        if len(selected) >= top_n:
+    fused_keys = sorted(
+        candidates,
+        key=lambda key: (-candidates[key]["rrf"], candidates[key]["best_rank"], str(key)),
+    )
+    for key in fused_keys:
+        if len(selected_keys) >= top_n:
             break
-        add_chunk(chunk)
+        select(key)
 
+    selected = [candidates[key]["chunk"] for key in selected_keys]
     doc_aggs = {}
     for chunk in selected:
         doc_name = str(chunk.get("docnm_kwd") or "")
@@ -249,22 +229,30 @@ def merge_task_results(task_results: list[dict], top_n: int, tasks: list[Retriev
 
 
 async def retrieve_and_merge_tasks(
-    tasks: list[RetrievalTask],
+    question: str,
+    sub_tasks: list[RetrievalTask],
     top_n: int,
     rerank_candidates_count: int,
     retrieve_task: Callable[[RetrievalTask, int], Awaitable[dict]],
 ) -> dict:
-    """Retrieve each task independently, then merge with protected quotas."""
-    if not tasks or top_n <= 0:
+    """Retrieve sub-questions plus the original safety query, then rank-fuse them."""
+    if not sub_tasks or top_n <= 0:
         return {"total": 0, "chunks": [], "doc_aggs": []}
 
-    per_task_quota = max(1, top_n // len(tasks))
-    per_task_top_n = min(rerank_candidates_count, max(4, per_task_quota * 2))
+    tasks = list(sub_tasks) + [RetrievalTask(query=question, is_original=True)]
     semaphore = asyncio.Semaphore(min(4, len(tasks)))
 
-    async def bounded_retrieve(task):
+    async def bounded_retrieve(task: RetrievalTask):
+        # Sub-questions need enough local candidates to survive de-duplication; the
+        # original query retains the user's configured Top N as a complete safety net.
+        task_top_n = top_n if task.is_original else min(top_n, 8)
+        task_top_n = min(max(1, rerank_candidates_count), max(1, task_top_n))
         async with semaphore:
-            return await retrieve_task(task, per_task_top_n)
+            try:
+                return await retrieve_task(task, task_top_n)
+            except Exception:  # noqa: BLE001 - one failed branch must not cancel siblings
+                logger.warning("Retrieval task failed: %r", task.query, exc_info=True)
+                return {"total": 0, "chunks": [], "doc_aggs": []}
 
     results = await asyncio.gather(*(bounded_retrieve(task) for task in tasks))
     return merge_task_results(results, top_n, tasks)

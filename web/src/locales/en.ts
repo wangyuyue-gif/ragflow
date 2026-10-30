@@ -1229,6 +1229,9 @@ This auto-tagging feature enhances retrieval by adding another layer of domain-s
       multiTurn: 'Multi-turn optimization',
       multiTurnTip:
         'This optimizes user queries using context in a multi-round conversation. When enabled, it will consume additional LLM tokens.',
+      queryDecomposition: 'Compound question decomposition',
+      queryDecompositionTip:
+        'Splits a compound information need into at most three independent retrieval queries while retaining the original query as a safety search. This increases latency and LLM token usage.',
       howUseId: 'How to use chat ID?',
       description: 'Description of assistant',
       descriptionPlaceholder: "I'm a chat assistant.",

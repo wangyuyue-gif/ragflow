@@ -1121,6 +1121,9 @@ NER：使用 spaCy NER 和基于规则的关键词提取来抽取 Entities 和 R
       multiTurn: '多轮对话优化',
       multiTurnTip:
         '在多轮对话时，对查询问题根据上下文进行优化。会调用大模型额外消耗 token。',
+      queryDecomposition: '复合问题拆分',
+      queryDecompositionTip:
+        '将需要多份证据的复合问题拆成最多 3 个独立检索问题，并保留原问题检索作为安全补充。会增加检索时间和大模型 token 消耗。',
       howUseId: '如何使用聊天 ID？',
       description: '助理描述',
       descriptionPlaceholder: '我是一个聊天助手。',

@@ -36,8 +36,8 @@ from api.db.services.knowledgebase_service import KnowledgebaseService, validate
 from api.db.services.langfuse_service import TenantLangfuseService
 from api.db.services.llm_service import LLMBundle, resolve_llm_setting
 from api.db.services.user_service import TenantService
-from common.metadata_utils import apply_meta_data_filter, filter_doc_ids_by_metadata
-from common.retrieval_tasks import retrieve_and_merge_tasks, split_retrieval_tasks
+from common.metadata_utils import apply_meta_data_filter
+from common.retrieval_tasks import plan_retrieval_tasks, retrieve_and_merge_tasks
 from api.utils.reference_metadata_utils import (
     enrich_chunks_with_document_metadata,
     resolve_reference_metadata_preferences,
@@ -656,7 +656,17 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
 
     retriever = settings.retriever
     questions = [m["content"] for m in messages if m["role"] == "user"][-3:]
-    initial_retrieval_tasks = split_retrieval_tasks(questions[-1])
+    prompt_config = dialog.prompt_config
+
+    # Build the standalone retrieval question before metadata filtering and query
+    # decomposition so both stages see the same multi-turn/cross-language context.
+    if len(questions) > 1 and prompt_config.get("refine_multiturn"):
+        questions = [await full_question(dialog.tenant_id, dialog.llm_id, messages)]
+    else:
+        questions = questions[-1:]
+    if prompt_config.get("cross_languages"):
+        questions = [await cross_languages(dialog.tenant_id, dialog.llm_id, questions[0], prompt_config["cross_languages"])]
+    decomposition_question = " ".join(questions)
 
     # Get scoped_doc_ids
     scoped_doc_ids = None
@@ -664,26 +674,29 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         scoped_doc_ids = [doc_id for doc_id in kwargs["doc_ids"].split(",") if doc_id]
     if "doc_ids" in messages[-1]:
         scoped_doc_ids = [doc_id for doc_id in messages[-1]["doc_ids"] if doc_id]
-    defer_generated_metadata_filter = (
-        len(initial_retrieval_tasks) > 1
-        and isinstance(dialog.meta_data_filter, dict)
-        and dialog.meta_data_filter.get("method") in {"auto", "semi_auto"}
-    )
-    if dialog.meta_data_filter and not defer_generated_metadata_filter:
+    base_scoped_doc_ids = list(scoped_doc_ids) if scoped_doc_ids is not None else None
+    metadata_cache = None
+
+    def load_metadata():
+        nonlocal metadata_cache
+        if metadata_cache is None:
+            metadata_cache = DocMetadataService.get_flatted_meta_by_kbs(dialog.kb_ids)
+        return metadata_cache
+
+    if dialog.meta_data_filter:
         scoped_doc_ids = await apply_meta_data_filter(
             dialog.meta_data_filter,
             None,
-            questions[-1],
+            decomposition_question,
             chat_mdl,
             scoped_doc_ids,
             kb_ids=dialog.kb_ids,
-            metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(dialog.kb_ids),
+            metas_loader=load_metadata,
         )
 
     # Get chat attachments
     text_attachments_content, image_attachments, image_files = get_files_content(messages[-1], llm_model_config["model_type"])
 
-    prompt_config = dialog.prompt_config
     rerank_candidates_count = getattr(dialog, "rerank_candidates_count", 64)
     include_reference_metadata, metadata_fields = _resolve_reference_metadata(prompt_config, request_payload=kwargs)
     field_map = KnowledgebaseService.get_field_map(dialog.kb_ids)
@@ -740,13 +753,13 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         if p["key"] not in kwargs:
             prompt_config["system"] = prompt_config["system"].replace("{%s}" % p["key"], " ")
 
-    if len(questions) > 1 and prompt_config.get("refine_multiturn"):
-        questions = [await full_question(dialog.tenant_id, dialog.llm_id, messages)]
-    else:
-        questions = questions[-1:]
-
-    if prompt_config.get("cross_languages"):
-        questions = [await cross_languages(dialog.tenant_id, dialog.llm_id, questions[0], prompt_config["cross_languages"])]
+    retrieval_tasks = []
+    if prompt_config.get("query_decomposition", False) and dialog.top_n >= 2:
+        retrieval_tasks = await plan_retrieval_tasks(
+            chat_mdl,
+            decomposition_question,
+            max_subquestions=min(3, dialog.top_n),
+        )
 
     if prompt_config.get("keyword", False):
         questions[-1] = questions[-1] + "," + await keyword_extraction(chat_mdl, questions[-1])
@@ -762,41 +775,29 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         knowledges = []
         if embd_mdl:
             retrieval_question = " ".join(questions)
-            retrieval_tasks = split_retrieval_tasks(retrieval_question)
             multi_task_retrieval = len(retrieval_tasks) > 1
-            if len(retrieval_tasks) > 1:
-                if len(retrieval_tasks) > dialog.top_n:
-                    logging.warning(
-                        "Retrieval task count exceeds Top N; truncating tasks: task_count=%d top_n=%d",
-                        len(retrieval_tasks),
-                        dialog.top_n,
-                    )
-                    retrieval_tasks = retrieval_tasks[: dialog.top_n]
-
-                metadata_cache = None
-
-                def load_metadata():
-                    nonlocal metadata_cache
-                    if metadata_cache is None:
-                        metadata_cache = DocMetadataService.get_flatted_meta_by_kbs(dialog.kb_ids)
-                    return metadata_cache
-
+            if multi_task_retrieval:
                 async def retrieve_task(task, task_top_n):
                     task_doc_ids = scoped_doc_ids
-                    if task.models:
-                        model_conditions = [{"key": "models", "op": "contains", "value": model} for model in task.models]
-                        task_doc_ids = filter_doc_ids_by_metadata(dialog.kb_ids, model_conditions, "or", load_metadata)
-                        if scoped_doc_ids is not None:
-                            allowed_doc_ids = set(scoped_doc_ids)
-                            task_doc_ids = [doc_id for doc_id in task_doc_ids if doc_id in allowed_doc_ids]
-                        if not task_doc_ids:
-                            task_doc_ids = ["-999"]
-
+                    if not task.is_original and isinstance(dialog.meta_data_filter, dict):
+                        # Generated metadata conditions must be derived independently
+                        # for each sub-question. Combining two models/aspects into one
+                        # global condition can accidentally exclude every document.
+                        if dialog.meta_data_filter.get("method") in {"auto", "semi_auto"}:
+                            generated_task_doc_ids = await apply_meta_data_filter(
+                                dialog.meta_data_filter,
+                                None,
+                                task.query,
+                                chat_mdl,
+                                base_scoped_doc_ids,
+                                kb_ids=dialog.kb_ids,
+                                metas_loader=load_metadata,
+                            )
+                            task_doc_ids = generated_task_doc_ids if generated_task_doc_ids is not None else base_scoped_doc_ids
                     logging.debug(
-                        "Multi-task retrieval: query=%r models=%s knowledge_types=%s doc_count=%d top_n=%d",
+                        "Decomposed retrieval: query=%r original=%s doc_count=%d top_n=%d",
                         task.query,
-                        task.models,
-                        task.knowledge_types,
+                        task.is_original,
                         len(task_doc_ids or []),
                         task_top_n,
                     )
@@ -824,6 +825,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     return task_result
 
                 kbinfos = await retrieve_and_merge_tasks(
+                    retrieval_question,
                     retrieval_tasks,
                     dialog.top_n,
                     rerank_candidates_count,
