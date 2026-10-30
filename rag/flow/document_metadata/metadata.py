@@ -14,34 +14,49 @@
 #  limitations under the License.
 #
 
+"""Conservative document metadata extraction from the filename only."""
+
 import re
+import unicodedata
 from collections.abc import Iterable
 from pathlib import Path
 
-from rag.utils.xcmg_models import find_model_mentions, normalize_text
+_UNICODE_HYPHENS = str.maketrans({char: "-" for char in "‐‑‒–—―﹘﹣－"})
 
-_DOCUMENT_TYPES = (
-    (re.compile(r"控制系统使用说明书"), "控制系统使用说明书", ("操作",)),
-    (re.compile(r"显示屏使用说明书"), "显示屏使用说明书", ("操作",)),
-    (re.compile(r"(?:操作与保养|操作保养|操保)手册"), "操作与保养手册", ("操作", "保养")),
-    (re.compile(r"(?:维修与保养|维修保养)手册"), "维修保养手册", ("维修", "保养")),
-    (re.compile(r"售后技术文件"), "售后技术文件", ()),
-    (re.compile(r"维修手册"), "维修手册", ("维修",)),
-    (re.compile(r"保养手册"), "保养手册", ("保养",)),
-    (re.compile(r"操作手册"), "操作手册", ("操作",)),
-    (re.compile(r"使用说明书"), "使用说明书", ("操作",)),
+_BRAND_PATTERN = re.compile(r"徐工|XCMG", re.IGNORECASE)
+_MANUAL_CODE_PATTERN = re.compile(r"(?<![A-Z0-9])PS\d{6,}(?![A-Z0-9])", re.IGNORECASE)
+
+# Known XCMG product-family prefixes. Keeping an allow-list prevents internal BOM
+# numbers, dates, battery capacities, engine models, and controller identifiers
+# from being promoted to equipment models merely because they contain letters and
+# digits. The captured token is preserved; no alias or sibling model is inferred.
+_MODEL_PATTERN = re.compile(
+    r"(?<![A-Z0-9])(?:XCA|XCT|XGC|XDR|XC|XE|LW|HB|GR|RP|XS|XZ)\d[A-Z0-9]*(?:-[A-Z0-9]+)*(?![A-Z0-9])",
+    re.IGNORECASE,
 )
 
 _EQUIPMENT_TYPES = (
-    ("轮胎式装载机", "轮胎式装载机"),
-    ("装载机", "轮胎式装载机"),
-    ("液压挖掘机", "液压挖掘机"),
-    ("挖掘机", "液压挖掘机"),
-    ("车载式混凝土泵车", "车载式混凝土泵车"),
-    ("混凝土泵车", "车载式混凝土泵车"),
+    (re.compile(r"液压挖掘机"), "液压挖掘机"),
+    (re.compile(r"轮胎式装载机"), "轮胎式装载机"),
+    (re.compile(r"车载式混凝土泵车"), "车载式混凝土泵车"),
+    # Less specific names are accepted only when the more specific canonical
+    # phrase above was not present.
+    (re.compile(r"装载机"), "轮胎式装载机"),
+    (re.compile(r"挖掘机"), "液压挖掘机"),
+    (re.compile(r"混凝土泵车|泵车"), "车载式混凝土泵车"),
 )
 
-_KNOWLEDGE_TYPE_ORDER = ("操作", "维修", "保养", "拆装", "故障维修")
+# Order expresses priority when a filename matches more than two categories.
+_MANUAL_TYPES = (
+    (re.compile(r"安全(?:规范|规定|手册)?"), "安全规范"),
+    (re.compile(r"操作|使用说明|操保"), "操作方法"),
+    (re.compile(r"保养周期|维护周期"), "保养周期"),
+    (re.compile(r"保养|维护|操保"), "保养步骤"),
+    (re.compile(r"故障|诊断|排查|维修"), "故障排查"),
+    (re.compile(r"油液|润滑油|液压油|机油"), "油液规格"),
+    (re.compile(r"技术参数|性能参数"), "技术参数"),
+    (re.compile(r"部件说明|结构说明|系统原理|原理图"), "部件说明"),
+)
 
 
 def _append_unique(target: list[str], values: Iterable[str]) -> None:
@@ -52,64 +67,57 @@ def _append_unique(target: list[str], values: Iterable[str]) -> None:
 
 def _normalize_filename(filename: str) -> str:
     name = Path(str(filename or "")).name
-    return normalize_text(name)
+    return unicodedata.normalize("NFKC", name).translate(_UNICODE_HYPHENS)
 
 
-def _detect_document_type(filename: str) -> tuple[str | None, list[str]]:
-    document_type = None
-    knowledge_types = []
-    for pattern, candidate_type, candidate_knowledge_types in _DOCUMENT_TYPES:
+def _extract_equipment_types(filename: str) -> list[str]:
+    for pattern, equipment_type in _EQUIPMENT_TYPES:
         if pattern.search(filename):
-            document_type = candidate_type
-            _append_unique(knowledge_types, candidate_knowledge_types)
+            return [equipment_type]
+    return []
+
+
+def _extract_manual_types(filename: str) -> list[str]:
+    manual_types = []
+    for pattern, manual_type in _MANUAL_TYPES:
+        if pattern.search(filename):
+            _append_unique(manual_types, (manual_type,))
+        if len(manual_types) >= 2:
             break
-
-    detected = set(knowledge_types)
-    if "操作" in filename or "操保" in filename or "使用说明书" in filename:
-        detected.add("操作")
-    if "保养" in filename or "操保" in filename:
-        detected.add("保养")
-    if "故障维修" in filename or "故障诊断" in filename or "故障排查" in filename:
-        detected.add("故障维修")
-    elif "维修" in filename:
-        detected.add("维修")
-    if "拆装" in filename:
-        detected.add("拆装")
-
-    return document_type, [item for item in _KNOWLEDGE_TYPE_ORDER if item in detected]
+    return manual_types
 
 
-def extract_document_metadata(filename: str) -> dict:
-    """Extract conservative document-level retrieval metadata from a filename."""
+def extract_document_metadata(filename: str) -> dict[str, list[str]]:
+    """Extract the five approved metadata fields from a filename.
+
+    Every value has one stable type: ``list[str]``. A field is omitted when the
+    filename does not provide reliable evidence. In particular, this function does
+    not infer brand from a model prefix and does not expand model aliases/families.
+    """
     normalized_name = _normalize_filename(filename)
-    metadata = {"brand": "徐工"}
-    models = []
-    model_aliases = []
-    equipment_types = []
+    metadata: dict[str, list[str]] = {}
 
-    for mention in find_model_mentions(normalized_name):
-        _append_unique(models, mention.official_models)
-        _append_unique(model_aliases, mention.aliases)
-        if mention.equipment_type:
-            _append_unique(equipment_types, (mention.equipment_type,))
+    if _BRAND_PATTERN.search(normalized_name):
+        metadata["brand"] = ["徐工"]
 
-    for marker, equipment_type in _EQUIPMENT_TYPES:
-        if marker in normalized_name:
-            equipment_types = [equipment_type]
-            break
-
-    document_type, knowledge_types = _detect_document_type(normalized_name)
-
+    equipment_types = _extract_equipment_types(normalized_name)
     if equipment_types:
-        metadata["equipment_type"] = equipment_types[0]
+        metadata["equipment_type"] = equipment_types
+
+    models = []
+    _append_unique(models, (match.group(0).upper() for match in _MODEL_PATTERN.finditer(normalized_name)))
     if models:
         metadata["models"] = models
-    if model_aliases:
-        metadata["model_aliases"] = model_aliases
-    if document_type:
-        metadata["document_type"] = document_type
-    if knowledge_types:
-        metadata["knowledge_types"] = knowledge_types
+
+    manual_codes = []
+    _append_unique(manual_codes, (match.group(0).upper() for match in _MANUAL_CODE_PATTERN.finditer(normalized_name)))
+    if manual_codes:
+        metadata["manual_code"] = manual_codes
+
+    manual_types = _extract_manual_types(normalized_name)
+    if manual_types:
+        metadata["manual_type"] = manual_types
+
     return metadata
 
 

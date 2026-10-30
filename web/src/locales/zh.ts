@@ -3085,6 +3085,9 @@ NER：使用 spaCy NER 和基于规则的关键词提取来抽取 Entities 和 R
       retrievalMemoryRequired: '请先选择记忆',
       tokenizerDescription:
         '根据所选的搜索方法，将文本转换为所需的数据结构（例如，用于嵌入搜索的 Embedding）。',
+      documentMetadata: '文档元数据',
+      documentMetadataDescription:
+        '从文件名保守提取品牌、设备类型、机型、手册编号和手册类型，不调用大模型。请放在分块节点或提取器之后、索引器之前。',
       generalChunkerDescription:
         '通用文本分块方式，适用于大多数文档类型，可灵活控制块大小、重叠和上下文范围。',
       tokenChunker: '按 Token 分块',

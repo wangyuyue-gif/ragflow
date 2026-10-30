@@ -3566,6 +3566,9 @@ This process aggregates variables from multiple branches into a single variable 
       retrievalMemoryRequired: 'Please select memories first',
       tokenizerDescription:
         'Transforms text into the required data structure (e.g., vector embeddings for Embedding Search) depending on the chosen search method.',
+      documentMetadata: 'Document metadata',
+      documentMetadataDescription:
+        'Conservatively extracts brand, equipment type, model, manual code, and manual type from the filename without calling an LLM. Place it after a chunker or extractor and before the indexer.',
       generalChunkerDescription:
         'A general-purpose chunking method for most document types, with flexible control over chunk size, overlap, and context.',
       tokenChunker: 'Token Chunker',
